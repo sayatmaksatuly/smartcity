@@ -1,0 +1,52 @@
+-- LOCAL TEST DATABASE ONLY: supabase test db
+-- Two synthetic auth IDs are transaction-scoped; no passwords or email are sent.
+begin;
+create extension if not exists pgtap with schema extensions;
+set local search_path = public, extensions;
+grant usage on schema extensions to authenticated, anon;
+select plan(32);
+
+select ok((select relrowsecurity and relforcerowsecurity from pg_class where oid = 'public.profiles'::regclass), 'profiles enforces RLS');
+select ok((select relrowsecurity and relforcerowsecurity from pg_class where oid = 'public.favorites'::regclass), 'favorites enforces RLS');
+select ok((select relrowsecurity and relforcerowsecurity from pg_class where oid = 'public.saved_walks'::regclass), 'saved_walks enforces RLS');
+select ok(has_column_privilege('authenticated', 'public.profiles', 'display_name', 'UPDATE'), 'can edit display name');
+select ok(not has_column_privilege('authenticated', 'public.profiles', 'id', 'UPDATE'), 'cannot change profile owner');
+select ok(not has_column_privilege('authenticated', 'public.profiles', 'created_at', 'INSERT'), 'cannot forge creation timestamp');
+select ok(has_column_privilege('authenticated', 'public.profiles', 'preferences', 'UPDATE'), 'can save allowed preferences');
+select ok(not has_table_privilege('anon', 'public.profiles', 'SELECT'), 'anonymous cannot select profiles');
+select ok(not has_table_privilege('anon', 'public.favorites', 'SELECT'), 'anonymous cannot select favorites');
+select ok(not has_table_privilege('anon', 'public.saved_walks', 'SELECT'), 'anonymous cannot select walks');
+select ok(public.aitu_walk_preferences_valid('{"duration_minutes":60,"travel_mode":"walking"}'), 'valid minimal preferences');
+select ok(not public.aitu_walk_preferences_valid('{"travel_mode":null}'), 'JSON null cannot bypass preference check');
+select ok(not public.aitu_walk_preferences_valid('{"lat":51,"lon":71}'), 'coordinates are not persisted as preferences');
+select ok(not public.aitu_walk_ids_valid(array['node/1','node/1']), 'duplicate places rejected');
+select ok(not public.aitu_walk_ids_valid(array['node/1',null]), 'null place rejected');
+select ok(not public.aitu_walk_ids_valid(array['node/1','node/2','node/3','node/4']), 'more than three places rejected');
+
+insert into auth.users(id) values ('10000000-0000-4000-8000-000000000001'), ('10000000-0000-4000-8000-000000000002');
+insert into public.profiles(id, display_name) values ('10000000-0000-4000-8000-000000000002','B');
+insert into public.favorites(user_id,poi_id) values ('10000000-0000-4000-8000-000000000002','node/2');
+insert into public.saved_walks(user_id,title,ordered_poi_ids) values ('10000000-0000-4000-8000-000000000002','B',array['node/2']);
+set local role authenticated;
+select set_config('request.jwt.claims','{"sub":"10000000-0000-4000-8000-000000000001","role":"authenticated"}',true);
+select lives_ok($$insert into public.profiles(display_name) values ('A')$$, 'A creates own profile with auth.uid default');
+select throws_ok($$update public.profiles set preferences='{"coordinates":[51,71]}'$$,'23514',null,'profile cannot store arbitrary preference keys');
+select lives_ok($$insert into public.favorites(poi_id) values ('node/1')$$, 'A creates own favorite');
+select lives_ok($$insert into public.saved_walks(title,ordered_poi_ids) values ('A',array['node/1'])$$, 'A creates own walk');
+select is((select count(*) from public.favorites),1::bigint,'A sees only own favorite');
+select throws_ok($$insert into public.favorites(user_id,poi_id) values ('10000000-0000-4000-8000-000000000002','node/3')$$,'42501',null,'A cannot forge favorite owner');
+select throws_ok($$update public.profiles set id='10000000-0000-4000-8000-000000000002'$$,'42501',null,'A cannot update immutable profile id');
+select throws_ok($$update public.saved_walks set user_id='10000000-0000-4000-8000-000000000002'$$,'42501',null,'A cannot reassign walk owner');
+select throws_ok($$insert into public.favorites(poi_id) values ('node/1')$$,'23505',null,'duplicate favorite rejected');
+select lives_ok($$select public.aitu_delete_my_personal_data()$$,'A can atomically delete own personal data');
+select is((select count(*) from public.profiles),0::bigint,'A profile removed');
+select is((select count(*) from public.favorites),0::bigint,'A favorites removed');
+select is((select count(*) from public.saved_walks),0::bigint,'A walks removed');
+select set_config('request.jwt.claims','{"sub":"10000000-0000-4000-8000-000000000002","role":"authenticated"}',true);
+select is((select count(*) from public.favorites),1::bigint,'B favorite survives A deletion');
+select is((select count(*) from public.saved_walks),1::bigint,'B walk survives A deletion');
+set local role anon;
+select throws_ok($$select public.aitu_delete_my_personal_data()$$,'42501',null,'anonymous cannot execute deletion RPC');
+reset role;
+select * from finish();
+rollback;
